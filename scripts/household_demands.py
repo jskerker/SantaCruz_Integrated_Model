@@ -1,0 +1,324 @@
+# Import Python libraries
+import sys
+import os
+import time
+import json
+import numpy as np
+import pandas as pd
+import calendar, datetime
+import csv
+import multiprocessing
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# Import the selected model run assumptions
+import scwsm_model_assumptions as scwsm
+
+class householdDemand:
+    
+
+    def __init__(self):
+        print('initialize householdDemand class instance')
+        self.HHdata = None
+        self.DCCcoef = None
+
+    # function to load the households data
+    def load_csv_hhdata(self, csv_file_path1):
+        """Load household data from CSV, only once per instance."""
+        if self.HHdata is None:
+            print("Loading HH data...")
+            self.HHdata = pd.read_csv(csv_file_path1)
+        else:
+            print("HH data already loaded, using cached version.")
+        self.HHdata_backup = self.HHdata.copy()
+        return self.HHdata
+
+    # function to load the DCC model coefficients
+    def load_csv_dcc_coef(self, csv_file_path2):
+        """Load DCC coefficients from CSV and convert to dictionary of floats, only once per instance."""
+        if self.DCCcoef is None:
+            print("Loading DCC coefficients...")
+            df = pd.read_csv(csv_file_path2)
+            df.columns = ['key', 'value']
+            dcc_dict = df.set_index('key').to_dict(orient='index')
+            for key in dcc_dict:
+                dcc_dict[key] = float(dcc_dict[key]['value'])
+            self.DCCcoef = dcc_dict
+            print('DCC coefficients: {}'.format(self.DCCcoef))
+        else:
+            print("DCC coefficients already loaded, using cached version.")
+        return self.DCCcoef
+
+    # function to initialize or update the necessary household data for updating the water demand calculations
+    def update_hh_data(self, margPrices, fixedFees, month, year, curtail=0, tempC=15, precipMM=0, AET=300, rnd_income_group=1, factor=1):
+        if self.HHdata is not None: #  or HHdata.empty
+
+            self.HHdata = self.HHdata_backup.copy()
+            self.taxValue = np.array(self.HHdata['tax_value'])
+            self.mainArea = np.array(self.HHdata['Main_Area'])
+            self.pool = np.array(self.HHdata['Pool2'])
+            self.bathrooms = np.array(self.HHdata['Bathrooms_F_H2'])
+
+            # get household residual values
+            self.resid_dbc = np.array(self.HHdata['mean_residuals_real']) # 'mean_residuals_log'
+
+            # number of accounts in dataset
+            self.num_accts = len(self.HHdata)
+
+            # random income group and column
+            self.rnd_income_group = rnd_income_group
+            self.col_name_income = 'map_inc_' + str(self.rnd_income_group)
+
+            # add income class to dataset
+            col_demand = 'income_class'
+            if col_demand not in self.HHdata.columns:
+                self.calc_income_class()
+            
+        else:
+            print('hh data is none')
+
+
+        # climate data
+        self.tempC = tempC
+        self.precipMM = precipMM
+        self.AET = AET
+
+        # sensitivity analysis factor
+        self.factor = factor
+
+        # number of days in month/year
+        _, self.num_days = calendar.monthrange(year, month)
+
+        # curtailment policy
+        self.curtail = curtail
+
+        # set fixed fees by pipe size
+        self.fixedFees = fixedFees
+        self.calcFixedFees()
+
+        # number of tiers
+        self.num_tiers = len(margPrices)
+        self.margPrices = margPrices
+        tier_cutoffs_array = margPrices['cutoff'].values
+        self.tier_cutoffs = np.insert(tier_cutoffs_array, 0, 0)
+        self.tier_diff = np.diff(self.tier_cutoffs)
+        
+        # get statistics for AR and bills-- hardcoded 5th, 50th, and 95th percentiles for now
+        self.prct_low = 0.05
+        self.prct_med = 0.5
+        self.prct_high = 0.95
+        
+        # create for loop for column names for totalBills and AR for all income classes and quantiles
+        self.income_classes = 16
+        prctiles = [self.prct_low, self.prct_med, self.prct_high]
+        col_names = []
+        col_names_bill = []
+        col_names_AR = []
+        for ic in np.arange(1, self.income_classes+1):
+            for prct in prctiles:
+                
+                col_name = 'demand_IC{}_Prct{}'.format(ic, prct)
+                col_names.append(col_name)
+                
+                col_name_bill = 'Bill_IC{}_Prct{}'.format(ic, prct)
+                col_names_bill.append(col_name_bill)
+        
+                col_name_AR = 'AR_IC{}_Prct{}'.format(ic, prct)
+                col_names_AR.append(col_name_AR)
+
+        self.col_names = col_names + col_names_bill + col_names_AR
+
+        
+    # this function computes the household demands using the DCC model coefficients in a vectorized form
+    def calcHHdemand_vectorized(self):
+
+        # add pandas dataframe columns for household demands and marginal prices
+        self.HHdata['demand'] = 0.0
+        self.HHdata['marg_price'] = 0.0
+        self.HHdata['tier'] = 0
+        self.HHdata['demand_sum'] = 0.0
+
+        # 1. create array for length of dataframe
+        Q = np.zeros((len(self.HHdata), self.num_tiers))
+             
+        # 2. for each tier, calculate the household water demands based on different marginal prices
+        for tier in range(0, self.num_tiers):
+             mPrice = self.margPrices.price[self.num_tiers-1-tier]
+             #print('tier: ', str(tier), ', marg price: ', mPrice)
+             # calculate demand estimates for each tier for each household
+             #logQ = (self.DCCcoef['beta0'] + self.DCCcoef['betaPAl']*np.log(mPrice)+self.DCCcoef['betaTax']*np.log(self.taxValue))
+             logQ = (self.DCCcoef['beta0'] + self.DCCcoef['betaPAl']*np.log(mPrice) + self.DCCcoef['betaTax']*np.log(self.taxValue) + self.DCCcoef['betaMA']*self.mainArea
+                 + self.DCCcoef['betaBath']*self.bathrooms + self.DCCcoef['betaBathSq']*(self.bathrooms**2) + self.DCCcoef['betaPool']*self.pool
+                 + self.DCCcoef['betaCurtail']*self.curtail + self.DCCcoef['betaAET']*self.AET + self.DCCcoef['betaPrecip']*self.precipMM + self.DCCcoef['betaTemp']*self.tempC)
+
+             Q[:,tier] = np.exp(logQ) + self.resid_dbc
+        
+        # 3. set up conditions and values
+        lst_conditions = []
+        lst_values = []
+        lst_tiers = []
+        lst_margPrices = []
+        for tier in range(self.num_tiers, 0, -1): # loop from highest to lowest
+            mPrice = self.margPrices.price[tier-1]
+            lb = self.tier_cutoffs[tier-1]
+            ub = self.tier_cutoffs[tier]
+
+            lst_conditions.append(Q[:,self.num_tiers-tier] >= ub)
+            lst_conditions.append(Q[:,self.num_tiers-tier] > lb)
+            lst_values.append(np.repeat(ub, self.num_accts)) 
+            lst_values.append(Q[:,self.num_tiers-tier])
+            lst_tiers.append(np.repeat(tier, self.num_accts))
+            lst_tiers.append(np.repeat(tier, self.num_accts))
+            lst_margPrices.append(np.repeat(self.margPrices.price[tier-1], self.num_accts))
+            lst_margPrices.append(np.repeat(self.margPrices.price[tier-1], self.num_accts))
+
+        # 4. use np.select to get themarginal prices
+        result_Q = np.select(lst_conditions, lst_values, default=0)
+        result_tier = np.select(lst_conditions, lst_tiers, default=0)
+        result_margPrices = np.select(lst_conditions, lst_margPrices, default=0)
+
+        # 5. add to HHdata dataframe
+        self.HHdata.loc[:,'demand'] = result_Q
+        self.HHdata['demand'] = self.HHdata['demand'] * self.factor # Sensitivity analysis
+        self.HHdata.loc[:,'marg_price'] = result_margPrices
+        self.HHdata.loc[:,'tier'] = result_tier
+        self.HHdata.loc[:,'demand_sum'] += result_Q
+
+    # this function takes in the household demands and computes the sum of monthly demands, converted to MG from CCF
+    def calcQ(self):
+        #print('sum total Q in MGD')
+        col_demand = 'demand'
+        if col_demand not in self.HHdata.columns:
+            self.calcHHdemand_vectorized()
+        ccf_to_mg = 748.052/1e6
+        Q_mgd = ccf_to_mg * self.HHdata['demand'].sum() / self.num_days
+        return Q_mgd
+
+    # this function computes the fixed fees for water costs
+    # fixedFees should be a pandas dataframe with two columns: (1) pipe_size and (2) the fixed fee
+    def calcFixedFees(self):
+        #print('calculate fixed fees')
+        # Merge the DataFrames on the 'pipe_size' column
+        self.HHdata = pd.merge(self.HHdata, self.fixedFees, on='pipe_size', how='left')
+
+
+    # this function computes the variable water bill costs
+    def calcVarCosts(self):
+        #print('calculate variable costs')
+        col_demand = 'demand'
+        if col_demand not in self.HHdata.columns:
+            self.calcHHdemand()
+        conditions = [self.HHdata['tier'] == i for i in range(1, self.num_tiers+1)]
+
+        choices = []
+        for k in range(self.num_tiers):
+            # Fixed charge for all previous tiers
+            fixed = 0
+            prev_cutoff = 0
+
+            for i in range(k):  # i = 0 ... k-1
+                cutoff = self.margPrices.loc[i, 'cutoff']
+                price = self.margPrices.loc[i, 'price']
+                fixed += (cutoff - prev_cutoff) * price
+                prev_cutoff = cutoff
+
+            # Variable charge for current tier k
+            price_k = self.margPrices.loc[k, 'price']
+            variable = (self.HHdata['demand'] - prev_cutoff) * price_k
+
+            # Total
+            choices.append(fixed + variable)
+
+        # Apply the conditions and choices
+        self.HHdata['vol_cost'] = np.select(conditions, choices, default=np.nan)
+        self.HHdata['vol_cost'] = self.HHdata['vol_cost'].fillna(0)
+
+
+    # this function calculates the total water bill costs
+    def calc_water_bill(self):
+        #print('calculate total water bill costs')
+        col_fixed = 'fixed_rts_fees'
+        col_var = 'vol_cost'
+        if col_fixed not in self.HHdata.columns:
+            self.calcFixedFees()
+        if col_var not in self.HHdata.columns:
+            self.calcVarCosts()
+        self.HHdata['totalWaterCosts'] = self.HHdata['fixed_rts_fees'] + self.HHdata['vol_cost']
+
+    # function to return household water bills for all accounts
+    def getWaterBills(self):
+        col_bill = 'totalWaterCosts'
+        if col_bill not in self.HHdata.columns:
+            self.calc_water_bill()
+        return self.HHdata['totalWaterCosts'].to_numpy()
+
+    # this function calculates the affordability ratio
+    def calcAR(self):
+        #print('calculate affordability ratios')
+        col_bill = 'totalWaterCosts'
+        if col_bill not in self.HHdata.columns:
+            self.calc_water_bill()
+        self.HHdata['AR'] = self.HHdata['totalWaterCosts']/(self.HHdata[self.col_name_income]/12)*100
+        return self.HHdata['AR'].to_numpy()
+
+
+    # function that takes the df columns for demand, bills, and AR and returns as a numpy array
+    def get_arr_hh_data(self):
+        col_AR = 'AR'
+        # check that we have calculated ARs
+        if col_AR not in self.HHdata.columns:
+            self.calcAR()
+        col_names = ['demand', 'totalWaterCosts', 'AR']
+        hh_data = self.HHdata[col_names]
+        return hh_data.to_numpy()
+    
+    # this function returns the number of accounts in the household dataset
+    def numAccounts(self):
+        return len(self.HHdata)
+
+    # this function returns an array with the sum of monthly demands in ccf for each tier
+    def sum_demand_by_tier(self):
+        df = self.HHdata['demand']
+        allocated_demand = self.allocate_demand(df)
+        
+        # Sum the allocations for each tier
+        tier_sums = pd.Series(allocated_demand.sum(axis=0), index=[f'tier{i+1}' for i in range(self.num_tiers)])
+        return tier_sums.values
+    
+    # this function is a helper function that loops through each tier and allocates the demands
+    def allocate_demand(self, demands):
+        allocated_demand = np.zeros((demands.size, self.num_tiers)) # create empty array for allocated demands- rows are each HH, columns are the tiers
+
+        # Loop through each tier and allocate the demand
+        for i in range(self.num_tiers):
+            if i == 0:
+                allocated_demand[:, i] = np.minimum(demands, self.tier_cutoffs[i+1])
+            else:
+                previous_cutoff = self.tier_cutoffs[i]
+                current_cutoff = self.tier_cutoffs[i+1]
+                allocated_demand[:, i] = np.minimum(np.maximum(demands - previous_cutoff, 0), current_cutoff - previous_cutoff)
+
+        return allocated_demand
+
+
+
+    
+    # calculate the income class for the household data
+    def calc_income_class(self):
+        bins = [0, 10000, 14999, 19999, 24999, 29999, 34999, 39999, 44999, 49999, 59999, 74999, 99999, 
+                        124999, 149999, 199999, 1000000]
+
+        self.HHdata['income_class'] = np.digitize(self.HHdata[self.col_name_income], bins, right=True)
+        
+    # calculate the water use in each tier for every account
+    def calc_tiered_water_use(self):
+
+        demand_remaining = self.df_random_data.loc[:, 'demand']
+        self.df_random_data = self.df_random_data.copy()
+        for i in range(self.num_tiers):
+            col_name = 'tier_' + str(i+1)
+            self.df_random_data.loc[:, col_name] = np.maximum(np.minimum(demand_remaining, self.tier_diff[i]), 0)
+            demand_remaining = demand_remaining - self.tier_diff[i]
+        
+        return self.df_random_data
+    
