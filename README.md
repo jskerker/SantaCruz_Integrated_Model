@@ -2,6 +2,7 @@
 Python implementation of a systems modeling framework using Pywr developed in:
 
 * Skerker, J.B., Klassert, C., Francois, B., Verma, A., Brown, C., and Fletcher, S.M., Climate change exacerbates water affordability crisis, Under Review. Code documentation by: Jennifer Skerker, Stanford University. Last updated: December 2025.
+
 Notes: This repository includes all of the novel code developed for this work. Please see the PDF "Git Documentation & Organization" for more details.
 
 File Organization:
