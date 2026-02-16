@@ -227,6 +227,8 @@ name_add = ''
 file_SA = None
 # Desal policy
 decision_vars = [0.654, 0.4, 0.5, 0.3, 0.1, 0.2]
+# note: comment on/off below lines to run different policy simulations
+# the above setup will run 10 * 6 * 5 * 3 = 900 simulations --> ~1-2 min/simulation
 #sim_model_run_predetermined(decision_vars, filepath, real_All, dT_All, dP_All, dCV_All, demand_All, name_add, file_SA)
 
 
