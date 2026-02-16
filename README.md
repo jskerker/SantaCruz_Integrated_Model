@@ -9,5 +9,39 @@ File Organization:
 * data: This folder contains data developed for this work, including the Discrete/Continuous Choice (DCC) model coefficients and the risk-of-failure (ROF) tables developed for different reservoir storage levels.
 * model_assumptions_and_scenarios: This folder contains json files containing the relevant asssumptions for infrastructure planning and rate development.
 * models: This folder contains the parent models (json files) used in building the systems model.
-* results: This folder is currently empty, but we could add some sample results (not household-level results though).
 * scripts: This folder contains the Python code developed for this project, as well as Python files to develop paper figures.
+
+Pywr Installation: To install Pywr, please follow the instructions at this link: https://pywr.github.io/pywr-docs/master/install.html.
+In order to run this on a MacBook with an "Apple Silicon" chip (2022 and newer), you need to create an X86 environment in Anaconda Navigator for Pywr to work. Create the new environment using Python version 3.12 and install the dependencies necessary for Pywr:
+
+```
+# Create the new environment with python 3.12
+conda create -n my_env python=3.12 --platform osx-64
+#proceed? y
+
+conda activate my_env
+
+# install dependencies for pywr
+pip install Cython
+pip install numpy
+pip install NetworkX
+pip install pandas
+pip install packaging
+conda install GLPK
+#proceed? y
+conda install pytables
+pip install xlrd
+pip install pytest
+pip install pytest
+pip install SciPy
+pip install Jupyter
+pip install matplotlib
+conda config --add channels conda-forge
+conda install -c conda-forge pywr
+conda install pylibtiff
+
+```
+
+
+
+
